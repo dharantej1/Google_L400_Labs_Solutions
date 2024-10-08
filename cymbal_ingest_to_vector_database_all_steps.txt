@@ -1,0 +1,285 @@
+import vertexai
+from vertexai.language_models import TextEmbeddingModel
+from vertexai.generative_models import GenerativeModel
+
+import pickle
+from IPython.display import display, Markdown
+
+from langchain_google_vertexai import VertexAIEmbeddings
+from langchain_community.document_loaders import PyMuPDFLoader
+from langchain_experimental.text_splitter import SemanticChunker
+
+from google.cloud import firestore
+from google.cloud.firestore_v1.vector import Vector
+from google.cloud.firestore_v1.base_vector_query import DistanceMeasure
+
+
+-------------
+
+
+PROJECT_ID = "qwiklabs-gcp-00-e4970b8c386a"  # @param {type:"string"}
+LOCATION = "us-central1"  # @param {type:"string"}
+
+import vertexai
+
+vertexai.init(project=PROJECT_ID, location=LOCATION)
+
+
+----------
+embedding_model = VertexAIEmbeddings(model_name="text-embedding-004")
+
+---------
+!gcloud storage cp gs://partner-genai-bucket/genai069/nyc_food_safety_manual.pdf .
+-----------
+
+loader = PyMuPDFLoader("./nyc_food_safety_manual.pdf")
+data = loader.load()
+---------------
+def clean_page(page):
+  return page.page_content.replace("-\n","")\
+                          .replace("\n"," ")\
+                          .replace("\x02","")\
+                          .replace("\x03","")\
+                          .replace("fo d P R O T E C T I O N  T R A I N I N G  M A N U A L","")\
+                          .replace("N E W  Y O R K  C I T Y  D E P A R T M E N T  O F  H E A L T H  &  M E N T A L  H Y G I E N E","")
+
+
+---------------
+
+cleaned_pages = []
+for pages in data:
+  cleaned_pages.append(clean_page(pages))
+
+text_splitter = SemanticChunker(embedding_model)
+docs = text_splitter.create_documents(cleaned_pages[0:4])
+chunked_content = [doc.page_content for doc in docs]
+
+----------------
+
+chunked_embeddings = embedding_model.embed_documents(chunked_content)
+
+--------------
+!gsutil cp gs://<bucket>/chunked_content.pkl .
+!gsutil cp gs://<bucket>/chunked_embeddings.pkl .
+chunked_content = pickle.load(open("chunked_content.pkl", "rb"))
+chunked_embeddings = pickle.load(open("chunked_embeddings.pkl", "rb"))
+
+
+
+
+
+# Populate a db variable with a Firestore Client.
+db = firestore.Client(project=PROJECT_ID)
+
+# Use a variable called collection to create a reference to a collection named food-safety.
+collection = db.collection('food-safety')
+
+# Using a combination of our lists chunked_content and chunked_embeddings, 
+# add a document to your collection for each of your chunked documents. 
+for i, (content, embedding) in enumerate(zip(chunked_content, chunked_embeddings)):
+    doc_ref = collection.document(f"doc_{i}")
+    doc_ref.set({
+        "content": content,
+        "embedding": Vector(embedding)
+    })
+
+
+
+
+
+
+!gcloud firestore indexes composite create \
+--collection-group=food-safety \
+--query-scope=COLLECTION \
+--field-config field-path=embedding,vector-config='{"dimension":"768", "flat": "{}"}' \
+--project="qwiklabs-gcp-00-e4970b8c386a"
+
+
+
+def search_vector_database(query: str):
+  context = ""
+  query_embedding = embedding_model.embed_query(query)
+  vector_query = collection.find_nearest(
+    vector_field="embedding",
+    query_vector=Vector(query_embedding),
+    distance_measure=DistanceMeasure.EUCLIDEAN,
+    limit=5,
+  )
+  docs = vector_query.stream()
+  context = [result.to_dict()['content'] for result in docs]
+  return context
+
+
+
+
+
+search_vector_database("How should I store food?")
+
+
+=======================================================================================
+main.py
+=======================================================================================
+
+import os
+import json
+import logging
+import google.cloud.logging
+from flask import Flask, render_template, request
+
+from google.cloud import firestore
+from google.cloud.firestore_v1.vector import Vector
+from google.cloud.firestore_v1.base_vector_query import DistanceMeasure
+
+import vertexai
+from vertexai.generative_models import GenerativeModel, GenerationConfig
+from langchain_google_vertexai import VertexAIEmbeddings
+
+# Configure Cloud Logging
+logging_client = google.cloud.logging.Client()
+logging_client.setup_logging()
+logging.basicConfig(level=logging.INFO)
+
+# Application Variables
+BOTNAME = "FreshBot"
+SUBTITLE = "Your Friendly Restaurant Safety Expert"
+
+app = Flask(__name__)
+
+# Initialize Firestore Client with Project ID
+PROJECT_ID = "qwiklabs-gcp-01-a365df012da7"  # Use your project ID
+db = firestore.Client(project=PROJECT_ID)
+
+# Firestore Collection Reference
+collection = db.collection('food-safety')
+
+# Vertex AI Embedding Model Initialization
+embedding_model = VertexAIEmbeddings(model_name="text-embedding-004")
+
+# Vertex AI Generative Model Initialization
+gen_model = GenerativeModel(model_name="gemini-1.5-pro-001")
+
+# Function to Search the Vector Database and Retrieve Relevant Context
+def search_vector_database(query: str):
+    query_embedding = embedding_model.embed_query(query)
+    vector_query = collection.find_nearest(
+        vector_field="embedding",
+        query_vector=Vector(query_embedding),
+        distance_measure=DistanceMeasure.EUCLIDEAN,
+        limit=5,
+    )
+    docs = vector_query.stream()
+    context = " ".join([result.to_dict()['content'] for result in docs])
+
+    # Log the context retrieved from the vector database
+    logging.info(context, extra={"labels": {"service": "cymbal-service", "component": "context"}})
+    return context
+
+# Function to Send Query and Context to Gemini and Get the Response
+def ask_gemini(question):
+    # Create a prompt template with context instructions
+    prompt_template = "Using the context provided below, answer the following question:\nContext: {context}\nQuestion: {question}\nAnswer:"
+    
+    # Retrieve context for the question using the search_vector_database function
+    context = search_vector_database(question)
+    
+    # Format the prompt with the question and retrieved context
+    formatted_prompt = prompt_template.format(context=context, question=question)
+    
+    # Define the generation configuration for the Gemini model
+    generation_config = GenerationConfig(
+        temperature=0.7,  # Adjust temperature as needed
+        max_output_tokens=256,  # Maximum tokens in the response
+        response_mime_type="application/json",  # MIME type of response
+    )
+    
+    # Define the contents parameter with the prompt text
+    contents = [
+        {
+            "role": "user",
+            "parts": [{"text": formatted_prompt}]
+        }
+    ]
+    
+    # Call the generate_content function with the defined parameters
+    response = gen_model.generate_content(
+        contents=contents,
+        generation_config=generation_config
+    )
+    
+    # Parse the JSON response to extract the answer field
+    response_text = response.text if response else "{}"  # Default to empty JSON if no response
+    try:
+        response_json = json.loads(response_text)  # Parse the JSON string into a dictionary
+        answer = response_json.get("answer", "No answer found.")  # Get the "answer" field
+    except json.JSONDecodeError:
+        answer = "Error: Unable to parse response."
+
+    return answer
+
+# Home page route
+@app.route("/", methods=["POST", "GET"])
+def main():
+    # Initial message for GET request
+    if request.method == "GET":
+        question = ""
+        answer = "Hi, I'm FreshBot, what can I do for you?"
+
+    # Handle POST request when the user submits a question
+    else:
+        question = request.form["input"]
+        
+        # Log the user's question
+        logging.info(question, extra={"labels": {"service": "cymbal-service", "component": "question"}})
+        
+        # Get the answer from Gemini based on the vector database search
+        answer = ask_gemini(question)
+
+    # Log the generated answer
+    logging.info(answer, extra={"labels": {"service": "cymbal-service", "component": "answer"}})
+    print("Answer: " + answer)
+
+    # Display the home page with the required variables set
+    config = {
+        "title": BOTNAME,
+        "subtitle": SUBTITLE,
+        "botname": BOTNAME,
+        "message": answer,
+        "input": question,
+    }
+
+    return render_template("index.html", config=config)
+
+# Run the Flask app
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
+
+
+
+=======================================================================================
+Build docker
+=======================================================================================
+
+
+docker build -t cymbal-docker-image -f Dockerfile .
+
+
+docker tag cymbal-docker-image us-central1-docker.pkg.dev/qwiklabs-gcp-01-a365df012da7/cymbal-artifact-repo/cymbal-docker-image
+
+
+gcloud auth configure-docker us-central1-docker.pkg.dev
+
+
+docker push us-central1-docker.pkg.dev/qwiklabs-gcp-01-a365df012da7/cymbal-artifact-repo/cymbal-docker-image
+
+
+=======================================================================================
+Deploying the Image to Cloud Run
+=======================================================================================
+
+
+gcloud run deploy cymbal-freshbot \
+    --image=us-central1-docker.pkg.dev/qwiklabs-gcp-01-a365df012da7/cymbal-artifact-repo/cymbal-docker-image \
+    --platform=managed \
+    --region=us-central1 \
+    --allow-unauthenticated
