@@ -1,5 +1,6 @@
 # Google_L400_Labs
 Build and Deploy a Generative AI solution using a RAG framework
+> **⚠️ Warning:** Make sure to replace all instances of `PROJECT_ID = "qwiklabs-gcp-00-e4970b8c386a"` with your own Google Cloud project ID. Failing to do so will result in errors or unintended behavior when accessing Google Cloud resources.
 
 
 # Cymbal Ingest to Vector Database
